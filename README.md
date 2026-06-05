@@ -35,11 +35,22 @@ streamlit run app.py
 - Buy-below price after margin of safety
 - Projected revenue and free cash flow
 - WACC vs terminal growth sensitivity table
+- Fama-French portfolio regression with factor exposures, alpha, and R-squared
 - CSV and Excel exports
+
+## Portfolio Regression
+
+Open the `Portfolio Regression` tab to run a monthly Fama-French regression for a basket of US-listed stocks.
+
+- Enter tickers separated by commas, such as `AAPL, MSFT, NVDA`.
+- Leave weights blank for an equal-weight portfolio, or enter matching weights like `40, 40, 20`.
+- Choose the Fama-French 3-factor or 5-factor model.
+- Choose `Monthly rebalance` to keep weights fixed each month, or `Buy and hold` to use starting weights and let the portfolio drift.
+- Click `Run Regression` to see annualized alpha, R-squared, market beta, factor exposures, diagnostics, monthly regression data, and a CSV export.
 
 ## Data
 
-Financial statements are loaded from Yahoo Finance through `yfinance` when available, with SEC EDGAR company facts as a free fallback for US-listed companies. Market price data is loaded through `yfinance` when available.
+Financial statements are loaded from Yahoo Finance through `yfinance` when available, with SEC EDGAR company facts as a free fallback for US-listed companies. Market price data is loaded through `yfinance` when available, with Yahoo chart data and Stooq fallbacks for price history. Portfolio regression factors are loaded from Kenneth French's data library.
 
 SEC requests use a default user agent. For a shared or production setup, set a more specific contact string:
 

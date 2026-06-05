@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO, StringIO
 import os
+from zipfile import ZipFile
 from typing import Iterable
 
 import numpy as np
@@ -55,6 +56,17 @@ SHARES_ROWS = (
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 SEC_DEFAULT_USER_AGENT = "dcf-valuation-streamlit-app/1.0 contact@example.com"
+
+FAMA_FRENCH_DATASETS = {
+    "Fama-French 3 Factor": {
+        "url": "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip",
+        "factors": ("Mkt-RF", "SMB", "HML"),
+    },
+    "Fama-French 5 Factor": {
+        "url": "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_CSV.zip",
+        "factors": ("Mkt-RF", "SMB", "HML", "RMW", "CMA"),
+    },
+}
 
 SEC_REVENUE_TAGS = (
     "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -144,8 +156,27 @@ class DCFResult:
     summary: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class FactorRegressionResult:
+    model_name: str
+    rebalancing_method: str
+    tickers: tuple[str, ...]
+    weights: pd.Series
+    ending_weights: pd.Series
+    coefficients: pd.DataFrame
+    diagnostics: pd.DataFrame
+    regression_data: pd.DataFrame
+    cumulative_returns: pd.DataFrame
+    price_source_notes: tuple[str, ...]
+    factor_source_note: str
+
+
 class DCFError(ValueError):
     """Raised when the valuation cannot be calculated from the available data."""
+
+
+class FactorRegressionError(ValueError):
+    """Raised when portfolio factor regression cannot be calculated."""
 
 
 def normalize_ticker(raw_ticker: str) -> str:
@@ -491,6 +522,310 @@ def summary_csv(result: DCFResult, sensitivity: pd.DataFrame) -> bytes:
     return "\n".join(parts).encode("utf-8")
 
 
+def analyze_fama_french_portfolio(
+    tickers: Iterable[str],
+    weights: Iterable[float] | None,
+    start,
+    end,
+    model_name: str,
+    rebalancing_method: str = "Monthly rebalance",
+) -> FactorRegressionResult:
+    tickers = tuple(normalize_ticker(ticker) for ticker in tickers if str(ticker).strip())
+    if not tickers:
+        raise FactorRegressionError("Enter at least one ticker.")
+    if model_name not in FAMA_FRENCH_DATASETS:
+        raise FactorRegressionError("Choose a supported Fama-French model.")
+
+    weight_series = normalize_portfolio_weights(tickers, weights)
+    rebalancing_method = normalize_rebalancing_method(rebalancing_method)
+    ticker_returns, source_notes = fetch_portfolio_monthly_returns(tickers, start, end)
+    ticker_returns = ticker_returns.dropna(how="any")
+    if ticker_returns.empty:
+        raise FactorRegressionError("No overlapping monthly return history was available for the selected tickers.")
+
+    portfolio_returns, ending_weights = build_portfolio_returns(ticker_returns, weight_series, rebalancing_method)
+    factors = fetch_fama_french_factors(model_name)
+    result = run_factor_regression(portfolio_returns, factors, model_name)
+    diagnostics = pd.concat(
+        [
+            pd.DataFrame([("Rebalancing method", rebalancing_method)], columns=["Metric", "Value"]),
+            result.diagnostics,
+        ],
+        ignore_index=True,
+    )
+
+    return FactorRegressionResult(
+        model_name=model_name,
+        rebalancing_method=rebalancing_method,
+        tickers=tickers,
+        weights=weight_series,
+        ending_weights=ending_weights,
+        coefficients=result.coefficients,
+        diagnostics=diagnostics,
+        regression_data=result.regression_data,
+        cumulative_returns=result.cumulative_returns,
+        price_source_notes=tuple(source_notes),
+        factor_source_note="Factor returns loaded from Kenneth French's data library.",
+    )
+
+
+def normalize_rebalancing_method(value: str) -> str:
+    normalized = str(value).strip().lower().replace("_", " ").replace("-", " ")
+    if normalized in {"monthly rebalance", "monthly rebalanced", "rebalance monthly"}:
+        return "Monthly rebalance"
+    if normalized in {"buy and hold", "buy hold", "buy-and-hold"}:
+        return "Buy and hold"
+    raise FactorRegressionError("Choose either Monthly rebalance or Buy and hold.")
+
+
+def normalize_portfolio_weights(tickers: Iterable[str], weights: Iterable[float] | None) -> pd.Series:
+    tickers = tuple(tickers)
+    if weights is None:
+        values = np.repeat(1 / len(tickers), len(tickers))
+    else:
+        values = np.array(list(weights), dtype=float)
+        if len(values) == 0:
+            values = np.repeat(1 / len(tickers), len(tickers))
+        if len(values) != len(tickers):
+            raise FactorRegressionError("The number of weights must match the number of tickers.")
+        if np.any(values < 0):
+            raise FactorRegressionError("Portfolio weights cannot be negative.")
+        if values.sum() > 1.5:
+            values = values / 100
+        total = values.sum()
+        if total <= 0:
+            raise FactorRegressionError("Portfolio weights must sum to more than zero.")
+        values = values / total
+
+    return pd.Series(values, index=tickers, name="Weight")
+
+
+def build_portfolio_returns(
+    ticker_returns: pd.DataFrame,
+    weights: pd.Series,
+    rebalancing_method: str,
+) -> tuple[pd.Series, pd.Series]:
+    rebalancing_method = normalize_rebalancing_method(rebalancing_method)
+    ticker_returns = ticker_returns.dropna(how="any")
+    if ticker_returns.empty:
+        raise FactorRegressionError("No overlapping monthly return history was available for the selected tickers.")
+
+    weights = weights.reindex(ticker_returns.columns)
+    if weights.isna().any():
+        missing = ", ".join(weights[weights.isna()].index)
+        raise FactorRegressionError(f"Missing portfolio weights for: {missing}.")
+
+    if rebalancing_method == "Monthly rebalance":
+        portfolio_returns = ticker_returns.dot(weights).rename("Portfolio return")
+        return portfolio_returns, weights.rename("Ending weight")
+
+    holding_values = (1 + ticker_returns).cumprod().mul(weights, axis=1)
+    portfolio_values = holding_values.sum(axis=1)
+    portfolio_returns = portfolio_values.pct_change()
+    portfolio_returns.iloc[0] = portfolio_values.iloc[0] - 1
+    portfolio_returns = portfolio_returns.rename("Portfolio return")
+    ending_weights = (holding_values.iloc[-1] / portfolio_values.iloc[-1]).rename("Ending weight")
+    return portfolio_returns, ending_weights
+
+
+def fetch_portfolio_monthly_returns(tickers: Iterable[str], start, end) -> tuple[pd.DataFrame, list[str]]:
+    returns: dict[str, pd.Series] = {}
+    notes: list[str] = []
+    for ticker in tickers:
+        prices, source = fetch_price_history(ticker, start, end)
+        monthly_prices = prices.resample("ME").last().dropna()
+        monthly_returns = monthly_prices.pct_change().dropna()
+        if monthly_returns.empty:
+            raise FactorRegressionError(f"Not enough monthly price history was available for {ticker}.")
+        returns[ticker] = monthly_returns.rename(ticker)
+        notes.append(f"{ticker}: {source}.")
+
+    return pd.DataFrame(returns), notes
+
+
+def fetch_price_history(ticker: str, start, end) -> tuple[pd.Series, str]:
+    import yfinance as yf
+
+    ticker = normalize_ticker(ticker)
+    yahoo_prices = _yahoo_chart_price_history(ticker, start, end)
+    if not yahoo_prices.empty:
+        return yahoo_prices, "Yahoo Finance chart API adjusted close"
+
+    history = _safe_call(
+        lambda: yf.Ticker(ticker).history(start=str(start), end=str(end), auto_adjust=True)
+    )
+    if isinstance(history, pd.DataFrame) and not history.empty and "Close" in history:
+        prices = _clean_price_series(history["Close"])
+        if not prices.empty:
+            return prices, "Yahoo Finance adjusted close"
+
+    stooq_prices = _stooq_price_history(ticker, start, end)
+    if not stooq_prices.empty:
+        return stooq_prices, "Stooq close price fallback"
+
+    raise FactorRegressionError(f"No price history was available for {ticker}.")
+
+
+def _yahoo_chart_price_history(ticker: str, start, end) -> pd.Series:
+    import requests
+
+    start_ts = int(pd.Timestamp(start).timestamp())
+    end_ts = int((pd.Timestamp(end) + pd.Timedelta(days=1)).timestamp())
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        f"?period1={start_ts}&period2={end_ts}&interval=1d&events=history&includeAdjustedClose=true"
+    )
+    try:
+        response = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        chart = response.json()["chart"]["result"][0]
+        timestamps = chart.get("timestamp", [])
+        indicators = chart.get("indicators", {})
+        adjusted = indicators.get("adjclose", [{}])[0].get("adjclose")
+        closes = adjusted or indicators.get("quote", [{}])[0].get("close")
+    except Exception:
+        return pd.Series(dtype=float)
+
+    if not timestamps or not closes:
+        return pd.Series(dtype=float)
+    index = pd.to_datetime(timestamps, unit="s", errors="coerce")
+    prices = pd.Series(closes, index=index)
+    return _clean_price_series(prices)
+
+
+def fetch_fama_french_factors(model_name: str) -> pd.DataFrame:
+    import requests
+
+    dataset = FAMA_FRENCH_DATASETS[model_name]
+    response = requests.get(dataset["url"], timeout=30)
+    response.raise_for_status()
+    with ZipFile(BytesIO(response.content)) as archive:
+        csv_name = archive.namelist()[0]
+        text = archive.read(csv_name).decode("latin1")
+    factors = parse_fama_french_csv(text)
+    expected_columns = list(dataset["factors"]) + ["RF"]
+    missing = [column for column in expected_columns if column not in factors]
+    if missing:
+        raise FactorRegressionError(f"Fama-French data is missing columns: {', '.join(missing)}.")
+    return factors[expected_columns]
+
+
+def parse_fama_french_csv(text: str) -> pd.DataFrame:
+    lines = text.splitlines()
+    try:
+        header_index = next(index for index, line in enumerate(lines) if line.strip().startswith(",Mkt-RF"))
+    except StopIteration as exc:
+        raise FactorRegressionError("Could not find the Fama-French factor table in the downloaded file.") from exc
+
+    table_lines: list[str] = []
+    for line in lines[header_index:]:
+        if table_lines and not line.strip():
+            break
+        first_cell = line.split(",", 1)[0].strip()
+        if not table_lines or (first_cell.isdigit() and len(first_cell) == 6):
+            table_lines.append(line)
+
+    raw = pd.read_csv(StringIO("\n".join(table_lines)))
+    date_column = raw.columns[0]
+    raw = raw.rename(columns={date_column: "date"})
+    raw = raw[raw["date"].astype(str).str.fullmatch(r"\d{6}")]
+    raw["date"] = pd.to_datetime(raw["date"].astype(str) + "01", format="%Y%m%d") + pd.offsets.MonthEnd(0)
+
+    factor_columns = [column for column in raw.columns if column != "date"]
+    for column in factor_columns:
+        raw[column] = pd.to_numeric(raw[column], errors="coerce") / 100
+    return raw.set_index("date").sort_index().dropna(how="all")
+
+
+def run_factor_regression(
+    portfolio_returns: pd.Series,
+    factors: pd.DataFrame,
+    model_name: str,
+) -> FactorRegressionResult:
+    import statsmodels.api as sm
+
+    factor_columns = list(FAMA_FRENCH_DATASETS[model_name]["factors"])
+    joined = pd.concat([portfolio_returns.rename("portfolio_return"), factors], axis=1, join="inner").dropna()
+    if len(joined) <= len(factor_columns) + 2:
+        raise FactorRegressionError("Not enough overlapping monthly observations for a reliable regression.")
+
+    y = joined["portfolio_return"] - joined["RF"]
+    x = sm.add_constant(joined[factor_columns], has_constant="add")
+    fitted = sm.OLS(y, x).fit()
+
+    coefficients = pd.DataFrame(
+        {
+            "Factor": ["Alpha" if index == "const" else index for index in fitted.params.index],
+            "Coefficient": fitted.params.to_numpy(),
+            "t-stat": fitted.tvalues.to_numpy(),
+            "p-value": fitted.pvalues.to_numpy(),
+        }
+    )
+    coefficients["Annualized alpha"] = np.where(
+        coefficients["Factor"].eq("Alpha"),
+        (1 + coefficients["Coefficient"]) ** 12 - 1,
+        np.nan,
+    )
+
+    regression_data = joined.copy()
+    regression_data["excess_return"] = y
+    regression_data["predicted_excess_return"] = fitted.fittedvalues
+    regression_data["residual"] = fitted.resid
+    regression_data["market_return"] = regression_data["Mkt-RF"] + regression_data["RF"]
+
+    cumulative_returns = pd.DataFrame(
+        {
+            "Portfolio": (1 + regression_data["portfolio_return"]).cumprod() - 1,
+            "Market proxy": (1 + regression_data["market_return"]).cumprod() - 1,
+        }
+    )
+
+    monthly_alpha = float(fitted.params["const"])
+    diagnostics = pd.DataFrame(
+        [
+            ("Model", model_name),
+            ("Start month", regression_data.index.min().strftime("%Y-%m")),
+            ("End month", regression_data.index.max().strftime("%Y-%m")),
+            ("Monthly alpha", monthly_alpha),
+            ("Annualized alpha", (1 + monthly_alpha) ** 12 - 1),
+            ("R-squared", float(fitted.rsquared)),
+            ("Adjusted R-squared", float(fitted.rsquared_adj)),
+            ("Observations", int(fitted.nobs)),
+        ],
+        columns=["Metric", "Value"],
+    )
+
+    return FactorRegressionResult(
+        model_name=model_name,
+        rebalancing_method="Monthly rebalance",
+        tickers=(),
+        weights=pd.Series(dtype=float),
+        ending_weights=pd.Series(dtype=float),
+        coefficients=coefficients,
+        diagnostics=diagnostics,
+        regression_data=regression_data,
+        cumulative_returns=cumulative_returns,
+        price_source_notes=(),
+        factor_source_note="Factor returns loaded from Kenneth French's data library.",
+    )
+
+
+def factor_regression_csv(result: FactorRegressionResult) -> bytes:
+    parts = [
+        "Diagnostics",
+        result.diagnostics.to_csv(index=False),
+        "\nStarting weights",
+        result.weights.rename_axis("Ticker").reset_index().to_csv(index=False),
+        "\nEnding weights",
+        result.ending_weights.rename_axis("Ticker").reset_index().to_csv(index=False),
+        "\nCoefficients",
+        result.coefficients.to_csv(index=False),
+        "\nRegression data",
+        result.regression_data.to_csv(),
+    ]
+    return "\n".join(parts).encode("utf-8")
+
+
 def validate_assumptions(assumptions: DCFAssumptions) -> None:
     if assumptions.projection_years < 1:
         raise DCFError("Projection years must be at least 1.")
@@ -671,6 +1006,16 @@ def _current_price(stock, fast_info, ticker: str) -> float | None:
         cleaned = _clean_number(history["Close"].dropna().iloc[-1])
         if cleaned and cleaned > 0:
             return cleaned
+
+    recent_prices = _yahoo_chart_price_history(
+        ticker,
+        pd.Timestamp.today().normalize() - pd.Timedelta(days=14),
+        pd.Timestamp.today().normalize(),
+    )
+    if not recent_prices.empty:
+        cleaned = _clean_number(recent_prices.iloc[-1])
+        if cleaned and cleaned > 0:
+            return cleaned
     return _stooq_current_price(ticker)
 
 
@@ -692,6 +1037,36 @@ def _stooq_current_price(ticker: str) -> float | None:
     if quote.empty or "Close" not in quote:
         return None
     return _clean_number(quote.iloc[0]["Close"])
+
+
+def _stooq_price_history(ticker: str, start, end) -> pd.Series:
+    import requests
+
+    start_date = pd.to_datetime(start).strftime("%Y%m%d")
+    end_date = pd.to_datetime(end).strftime("%Y%m%d")
+    stooq_symbol = ticker.replace("-", ".").lower()
+    url = f"https://stooq.com/q/d/l/?s={stooq_symbol}.us&d1={start_date}&d2={end_date}&i=d"
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        history = pd.read_csv(StringIO(response.text))
+    except Exception:
+        return pd.Series(dtype=float)
+
+    if history.empty or "Date" not in history or "Close" not in history:
+        return pd.Series(dtype=float)
+    history["Date"] = pd.to_datetime(history["Date"], errors="coerce")
+    prices = pd.Series(pd.to_numeric(history["Close"], errors="coerce").to_numpy(), index=history["Date"])
+    return _clean_price_series(prices)
+
+
+def _clean_price_series(series: pd.Series) -> pd.Series:
+    prices = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    prices.index = pd.to_datetime(prices.index, errors="coerce")
+    prices = prices[prices.index.notna()].sort_index()
+    if getattr(prices.index, "tz", None) is not None:
+        prices.index = prices.index.tz_localize(None)
+    return prices[prices > 0]
 
 
 def _number_from_mapping(mapping, keys: Iterable[str]) -> float | None:

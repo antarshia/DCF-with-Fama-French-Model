@@ -1,4 +1,8 @@
 from __future__ import annotations
+#python -m streamlit run app.py run in the terminal 
+#it will give you the local URL, or autometically pop up
+#the network URL is also working too. 
+from datetime import date
 
 import pandas as pd
 import plotly.express as px
@@ -7,9 +11,12 @@ import streamlit as st
 from dcf_model import (
     DCFAssumptions,
     DCFError,
+    FactorRegressionError,
+    analyze_fama_french_portfolio,
     calculate_dcf,
     default_assumptions,
     export_workbook,
+    factor_regression_csv,
     fetch_ticker_data,
     is_probably_us_listed,
     sensitivity_table,
@@ -119,6 +126,18 @@ def load_ticker(ticker: str):
     return fetch_ticker_data(ticker)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_factor_regression(
+    tickers: tuple[str, ...],
+    weights: tuple[float, ...] | None,
+    start_date: date,
+    end_date: date,
+    model_name: str,
+    rebalancing_method: str,
+):
+    return analyze_fama_french_portfolio(tickers, weights, start_date, end_date, model_name, rebalancing_method)
+
+
 def money(value: float | None, currency: str = "USD") -> str:
     if value is None or pd.isna(value):
         return "N/A"
@@ -142,6 +161,57 @@ def pct(value: float | None) -> str:
     if value is None or pd.isna(value):
         return "N/A"
     return f"{value:.1%}"
+
+
+def parse_tickers(value: str) -> tuple[str, ...]:
+    return tuple(part.strip().upper() for part in value.replace("\n", ",").split(",") if part.strip())
+
+
+def parse_weights(value: str) -> tuple[float, ...] | None:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return tuple(float(part.strip().replace("%", "")) for part in cleaned.replace("\n", ",").split(",") if part.strip())
+
+
+def diagnostic_value(diagnostics: pd.DataFrame, metric: str):
+    row = diagnostics[diagnostics["Metric"].eq(metric)]
+    if row.empty:
+        return None
+    return row.iloc[0]["Value"]
+
+
+def style_factor_coefficients(df: pd.DataFrame) -> pd.DataFrame:
+    display = df.copy()
+    display["Coefficient"] = display.apply(
+        lambda row: pct(row["Coefficient"]) if row["Factor"] == "Alpha" else f"{row['Coefficient']:.2f}",
+        axis=1,
+    )
+    display["Annualized alpha"] = display["Annualized alpha"].map(lambda value: pct(value) if pd.notna(value) else "")
+    display["t-stat"] = display["t-stat"].map(lambda value: f"{value:.2f}")
+    display["p-value"] = display["p-value"].map(lambda value: f"{value:.3f}")
+    return display
+
+
+def style_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
+    percent_metrics = {"Monthly alpha", "Annualized alpha", "R-squared", "Adjusted R-squared"}
+    display = df.copy()
+    display["Value"] = display.apply(
+        lambda row: pct(row["Value"]) if row["Metric"] in percent_metrics and isinstance(row["Value"], float) else row["Value"],
+        axis=1,
+    )
+    return display
+
+
+def style_weight_table(starting_weights: pd.Series, ending_weights: pd.Series, include_ending: bool) -> pd.DataFrame:
+    display = starting_weights.rename("Starting weight").rename_axis("Ticker").reset_index()
+    if include_ending:
+        ending = ending_weights.rename("Ending weight").rename_axis("Ticker").reset_index()
+        display = display.merge(ending, on="Ticker", how="left")
+    for column in display.columns:
+        if column.endswith("weight"):
+            display[column] = display[column].map(pct)
+    return display
 
 
 def style_projection(df: pd.DataFrame, currency: str):
@@ -187,7 +257,7 @@ def main() -> None:
     st.title("DCF Valuation")
 
     if "active_ticker" not in st.session_state:
-        st.session_state.active_ticker = None
+        st.session_state.active_ticker = "AAPL"
 
     query_ticker = st.query_params.get("ticker")
     if query_ticker:
@@ -213,12 +283,6 @@ def main() -> None:
         st.query_params["ticker"] = ticker
 
     active_ticker = st.session_state.active_ticker
-    if not active_ticker:
-        st.markdown(
-            "<p class='small-note'>Enter a US-listed stock ticker and calculate a discounted cash-flow valuation.</p>",
-            unsafe_allow_html=True,
-        )
-        return
 
     try:
         with st.spinner(f"Loading {active_ticker} financial statements..."):
@@ -362,8 +426,8 @@ def main() -> None:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    tab_projection, tab_sensitivity, tab_history, tab_export = st.tabs(
-        ["Projection", "Sensitivity", "Historical data", "Export"]
+    tab_projection, tab_sensitivity, tab_history, tab_portfolio, tab_export = st.tabs(
+        ["Projection", "Sensitivity", "Historical data", "Portfolio Regression", "Export"]
     )
 
     with tab_projection:
@@ -375,6 +439,136 @@ def main() -> None:
 
     with tab_history:
         st.dataframe(style_history(data.financial_history, data.currency), use_container_width=True, hide_index=True)
+
+    with tab_portfolio:
+        st.markdown("### Fama-French Portfolio Regression")
+        with st.form("factor-regression-form", border=False):
+            input_col_1, input_col_2 = st.columns([0.55, 0.45])
+            with input_col_1:
+                portfolio_tickers = st.text_input("Portfolio tickers", value="AAPL, MSFT, NVDA")
+                portfolio_weights = st.text_input("Weights", value="", help="Leave blank for equal weights, or enter values like 40, 40, 20.")
+                model_name = st.selectbox(
+                    "Factor model",
+                    ["Fama-French 5 Factor", "Fama-French 3 Factor"],
+                    index=0,
+                )
+            with input_col_2:
+                rebalancing_method = st.radio(
+                    "Rebalancing method",
+                    ["Monthly rebalance", "Buy and hold"],
+                    horizontal=True,
+                )
+                start_date = st.date_input("Start date", value=date(2020, 1, 1), min_value=date(1980, 1, 1))
+                end_date = st.date_input("End date", value=date.today(), min_value=date(1980, 1, 1))
+                run_regression = st.form_submit_button("Run Regression", use_container_width=True)
+
+        if not run_regression:
+            st.markdown(
+                "<p class='small-note'>Enter a weighted portfolio and run a monthly Fama-French regression. "
+                "Blank weights use equal starting weights. Monthly rebalance keeps weights fixed; buy and hold lets weights drift.</p>",
+                unsafe_allow_html=True,
+            )
+        else:
+            try:
+                tickers = parse_tickers(portfolio_tickers)
+                weights = parse_weights(portfolio_weights)
+                if start_date >= end_date:
+                    raise FactorRegressionError("Start date must be before end date.")
+                with st.spinner("Loading prices, factors, and running regression..."):
+                    regression = load_factor_regression(
+                        tickers,
+                        weights,
+                        start_date,
+                        end_date,
+                        model_name,
+                        rebalancing_method,
+                    )
+            except (FactorRegressionError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                market_beta = regression.coefficients.loc[
+                    regression.coefficients["Factor"].eq("Mkt-RF"), "Coefficient"
+                ].iloc[0]
+                metric_alpha, metric_r2, metric_beta, metric_obs = st.columns(4)
+                metric_alpha.metric("Annualized alpha", pct(diagnostic_value(regression.diagnostics, "Annualized alpha")))
+                metric_r2.metric("R-squared", pct(diagnostic_value(regression.diagnostics, "R-squared")))
+                metric_beta.metric("Market beta", f"{market_beta:.2f}")
+                metric_obs.metric("Monthly observations", f"{int(diagnostic_value(regression.diagnostics, 'Observations'))}")
+
+                chart_col_1, chart_col_2 = st.columns([0.58, 0.42], gap="large")
+                with chart_col_1:
+                    cumulative = regression.cumulative_returns.reset_index(names="Month").melt(
+                        id_vars="Month",
+                        var_name="Series",
+                        value_name="Cumulative return",
+                    )
+                    cumulative_fig = px.line(
+                        cumulative,
+                        x="Month",
+                        y="Cumulative return",
+                        color="Series",
+                        color_discrete_map={"Portfolio": "#176b64", "Market proxy": "#4b5f8f"},
+                    )
+                    cumulative_fig.update_layout(
+                        height=330,
+                        margin=dict(l=10, r=10, t=20, b=10),
+                        paper_bgcolor="#ffffff",
+                        plot_bgcolor="#ffffff",
+                        legend_title_text="",
+                        yaxis_tickformat=".0%",
+                    )
+                    st.plotly_chart(cumulative_fig, use_container_width=True)
+
+                with chart_col_2:
+                    exposures = regression.coefficients[~regression.coefficients["Factor"].eq("Alpha")].copy()
+                    exposure_fig = px.bar(
+                        exposures,
+                        x="Factor",
+                        y="Coefficient",
+                        color="Coefficient",
+                        color_continuous_scale=["#9a5b1f", "#f3f6f4", "#176b64"],
+                    )
+                    exposure_fig.update_layout(
+                        height=330,
+                        margin=dict(l=10, r=10, t=20, b=10),
+                        paper_bgcolor="#ffffff",
+                        plot_bgcolor="#ffffff",
+                        coloraxis_showscale=False,
+                        yaxis_title="Exposure",
+                    )
+                    st.plotly_chart(exposure_fig, use_container_width=True)
+
+                result_tab_1, result_tab_2, result_tab_3, result_tab_4 = st.tabs(
+                    ["Coefficients", "Diagnostics", "Regression data", "Export regression"]
+                )
+                with result_tab_1:
+                    st.dataframe(style_factor_coefficients(regression.coefficients), use_container_width=True, hide_index=True)
+                with result_tab_2:
+                    st.dataframe(
+                        style_weight_table(
+                            regression.weights,
+                            regression.ending_weights,
+                            regression.rebalancing_method == "Buy and hold",
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.dataframe(style_diagnostics(regression.diagnostics), use_container_width=True, hide_index=True)
+                    notes = " ".join(regression.price_source_notes + (regression.factor_source_note,))
+                    st.markdown(f"<p class='small-note'>{notes}</p>", unsafe_allow_html=True)
+                with result_tab_3:
+                    regression_display = regression.regression_data.copy()
+                    for column in regression_display.columns:
+                        regression_display[column] = regression_display[column].map(lambda value: f"{value:.2%}")
+                    st.dataframe(regression_display, use_container_width=True)
+                with result_tab_4:
+                    st.download_button(
+                        "Download Regression CSV",
+                        data=factor_regression_csv(regression),
+                        file_name="fama_french_portfolio_regression.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
 
     with tab_export:
         download_1, download_2 = st.columns(2)

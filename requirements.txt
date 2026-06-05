@@ -5,3 +5,4 @@ numpy>=1.26
 plotly>=5.20
 openpyxl>=3.1
 requests>=2.31
+statsmodels>=0.14

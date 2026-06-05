@@ -5,8 +5,12 @@ import pandas as pd
 from dcf_model import (
     DCFAssumptions,
     TickerData,
+    build_portfolio_returns,
     build_financial_history_from_sec,
     calculate_dcf,
+    normalize_portfolio_weights,
+    parse_fama_french_csv,
+    run_factor_regression,
     sensitivity_table,
 )
 
@@ -148,3 +152,87 @@ def test_build_financial_history_from_sec_companyfacts():
 
     assert list(history["fiscal_year"]) == [2022, 2023]
     assert list(history["free_cash_flow"]) == [150_000, 170_000]
+
+
+def test_normalize_portfolio_weights_accepts_percent_inputs():
+    weights = normalize_portfolio_weights(("AAPL", "MSFT", "NVDA"), (40, 40, 20))
+
+    assert math.isclose(weights.sum(), 1.0)
+    assert math.isclose(weights["AAPL"], 0.4)
+    assert math.isclose(weights["NVDA"], 0.2)
+
+
+def test_monthly_rebalance_portfolio_returns_keep_weights_fixed():
+    index = pd.date_range("2024-01-31", periods=3, freq="ME")
+    ticker_returns = pd.DataFrame(
+        {
+            "AAA": [0.10, 0.00, 0.10],
+            "BBB": [0.00, 0.10, 0.00],
+        },
+        index=index,
+    )
+    weights = normalize_portfolio_weights(("AAA", "BBB"), (50, 50))
+
+    portfolio_returns, ending_weights = build_portfolio_returns(ticker_returns, weights, "Monthly rebalance")
+
+    assert list(portfolio_returns.round(4)) == [0.05, 0.05, 0.05]
+    assert math.isclose(ending_weights["AAA"], 0.5)
+    assert math.isclose(ending_weights["BBB"], 0.5)
+
+
+def test_buy_and_hold_portfolio_returns_allow_weight_drift():
+    index = pd.date_range("2024-01-31", periods=3, freq="ME")
+    ticker_returns = pd.DataFrame(
+        {
+            "AAA": [0.10, 0.00, 0.10],
+            "BBB": [0.00, 0.10, 0.00],
+        },
+        index=index,
+    )
+    weights = normalize_portfolio_weights(("AAA", "BBB"), (50, 50))
+
+    portfolio_returns, ending_weights = build_portfolio_returns(ticker_returns, weights, "Buy and hold")
+
+    assert math.isclose(portfolio_returns.iloc[0], 0.05)
+    assert math.isclose(portfolio_returns.iloc[1], 0.05 / 1.05)
+    assert math.isclose(portfolio_returns.iloc[2], 0.055 / 1.10)
+    assert ending_weights["AAA"] > 0.5
+    assert ending_weights["BBB"] < 0.5
+
+
+def test_parse_fama_french_csv_converts_percent_to_decimal():
+    sample = """This file was created using a test database.
+
+,Mkt-RF,SMB,HML,RMW,CMA,RF
+202401,    1.00,   -2.00,    3.00,    0.50,   -0.25,    0.40
+202402,   -1.50,    0.25,   -0.75,    0.10,    0.20,    0.38
+
+Annual Factors:
+"""
+
+    factors = parse_fama_french_csv(sample)
+
+    assert list(factors.columns) == ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]
+    assert math.isclose(factors.iloc[0]["Mkt-RF"], 0.01)
+    assert math.isclose(factors.iloc[1]["RF"], 0.0038)
+
+
+def test_run_factor_regression_estimates_synthetic_betas():
+    index = pd.date_range("2020-01-31", periods=24, freq="ME")
+    factors = pd.DataFrame(
+        {
+            "Mkt-RF": [0.01, -0.02, 0.03, 0.00] * 6,
+            "SMB": [0.02, 0.01, -0.01, -0.02] * 6,
+            "HML": [-0.01, 0.01, 0.02, -0.02] * 6,
+            "RF": [0.001] * 24,
+        },
+        index=index,
+    )
+    portfolio_returns = factors["RF"] + 0.002 + 1.25 * factors["Mkt-RF"] - 0.4 * factors["SMB"] + 0.3 * factors["HML"]
+
+    result = run_factor_regression(portfolio_returns, factors, "Fama-French 3 Factor")
+    coefficients = result.coefficients.set_index("Factor")["Coefficient"]
+
+    assert math.isclose(coefficients["Alpha"], 0.002, abs_tol=1e-12)
+    assert math.isclose(coefficients["Mkt-RF"], 1.25, abs_tol=1e-12)
+    assert math.isclose(coefficients["SMB"], -0.4, abs_tol=1e-12)
