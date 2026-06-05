@@ -1,5 +1,12 @@
 # DCF Valuation Model App
 
+to run this, you can open vs code and run the following code
+python -m streamlit run app.py
+or python3 
+depends on what you have in your computer. 
+It will pop up automatically or give you two options (locally and network URL) both could works. 
+
+
 This Streamlit app calculates a discounted cash-flow valuation for US-listed stocks from a ticker symbol. Enter a ticker, edit your assumptions, and the app estimates intrinsic value per share.
 
 Use this as an education and stock-screening tool. It is not financial advice, and trading decisions should not rely on this model alone.
