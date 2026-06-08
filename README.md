@@ -1,4 +1,4 @@
-# DCF Valuation Model App
+# DCF with Fama-French Model App
 
 to run this, you can open vs code and run the following code
 python -m streamlit run app.py
