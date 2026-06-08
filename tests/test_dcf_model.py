@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 
 import pandas as pd
 
@@ -8,6 +9,9 @@ from dcf_model import (
     build_portfolio_returns,
     build_financial_history_from_sec,
     calculate_dcf,
+    calculate_stock_metrics,
+    portfolio_performance_metrics,
+    portfolio_risk_contribution,
     normalize_portfolio_weights,
     parse_fama_french_csv,
     run_factor_regression,
@@ -198,6 +202,77 @@ def test_buy_and_hold_portfolio_returns_allow_weight_drift():
     assert math.isclose(portfolio_returns.iloc[2], 0.055 / 1.10)
     assert ending_weights["AAA"] > 0.5
     assert ending_weights["BBB"] < 0.5
+
+
+def test_calculate_stock_metrics_includes_valuation_quality_and_risk_formulas():
+    assumptions = DCFAssumptions(
+        growth_rate_stage_1=0.08,
+        growth_rate_stage_2=0.04,
+        target_fcf_margin=0.15,
+        wacc=0.09,
+        terminal_growth_rate=0.025,
+        projection_years=10,
+        margin_of_safety=0.25,
+    )
+    data = replace(
+        sample_ticker_data(),
+        market_cap=10_000_000_000,
+        net_income=1_000_000_000,
+        pretax_income=1_250_000_000,
+        tax_provision=250_000_000,
+        ebit=1_200_000_000,
+        ebitda=1_500_000_000,
+        total_equity=5_000_000_000,
+        total_assets=8_000_000_000,
+        total_liabilities=3_000_000_000,
+        current_assets=2_000_000_000,
+        current_liabilities=1_000_000_000,
+        retained_earnings=2_000_000_000,
+        trailing_eps=10.0,
+        forward_eps=12.0,
+        dividend_rate=2.0,
+        beta=1.1,
+    )
+
+    result = calculate_dcf(data, assumptions)
+    metrics = calculate_stock_metrics(data, result, assumptions).set_index("Metric")
+
+    assert math.isclose(metrics.loc["FCF yield", "Value"], 155_000_000 / 10_000_000_000)
+    assert math.isclose(metrics.loc["P/E", "Value"], 10.0)
+    assert metrics.loc["ROIC", "Value"] > 0
+    assert metrics.loc["Altman Z-score", "Value"] > 0
+    assert metrics.loc["DDM value / share", "Value"] > 0
+
+
+def test_portfolio_performance_metrics_calculate_risk_adjusted_values():
+    index = pd.date_range("2024-01-31", periods=8, freq="ME")
+    portfolio_returns = pd.Series([0.02, -0.01, 0.03, 0.01, -0.02, 0.04, 0.00, 0.02], index=index)
+    benchmark_returns = pd.Series([0.01, -0.02, 0.02, 0.01, -0.01, 0.03, 0.00, 0.01], index=index)
+
+    metrics = portfolio_performance_metrics(portfolio_returns, benchmark_returns, 0.04, "SPY").set_index("Metric")
+
+    assert metrics.loc["CAGR", "Value"] > 0
+    assert metrics.loc["Annualized volatility", "Value"] > 0
+    assert metrics.loc["Maximum drawdown", "Value"] < 0
+    assert metrics.loc["Sharpe ratio", "Value"] is not None
+    assert metrics.loc["Beta", "Value"] > 0
+
+
+def test_portfolio_risk_contribution_sums_to_full_portfolio_risk():
+    index = pd.date_range("2024-01-31", periods=6, freq="ME")
+    ticker_returns = pd.DataFrame(
+        {
+            "AAA": [0.02, -0.01, 0.03, 0.01, -0.02, 0.04],
+            "BBB": [0.01, 0.00, 0.01, -0.01, 0.02, 0.01],
+            "CCC": [-0.01, 0.02, 0.00, 0.03, 0.01, -0.02],
+        },
+        index=index,
+    )
+    weights = normalize_portfolio_weights(("AAA", "BBB", "CCC"), (50, 30, 20))
+
+    contribution = portfolio_risk_contribution(ticker_returns, weights, weights, "Monthly rebalance")
+
+    assert math.isclose(contribution["Risk contribution"].sum(), 1.0)
 
 
 def test_parse_fama_french_csv_converts_percent_to_decimal():

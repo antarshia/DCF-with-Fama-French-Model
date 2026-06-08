@@ -1,7 +1,7 @@
 from __future__ import annotations
-#python -m streamlit run app.py run in the terminal 
-#it will give you the local URL, or autometically pop up
-#the network URL is also working too. 
+
+# Run locally with: python -m streamlit run app.py
+# Streamlit will open a local URL automatically, or print local/network URLs in the terminal.
 from datetime import date
 
 import pandas as pd
@@ -12,13 +12,17 @@ from dcf_model import (
     DCFAssumptions,
     DCFError,
     FactorRegressionError,
+    PortfolioAnalyticsError,
     analyze_fama_french_portfolio,
+    analyze_portfolio,
     calculate_dcf,
+    calculate_stock_metrics,
     default_assumptions,
     export_workbook,
     factor_regression_csv,
     fetch_ticker_data,
     is_probably_us_listed,
+    portfolio_analytics_csv,
     sensitivity_table,
     summary_csv,
 )
@@ -31,6 +35,7 @@ st.set_page_config(
 )
 
 
+# Hide Streamlit's default app chrome so the page reads like a focused valuation tool.
 st.markdown(
     """
     <style>
@@ -126,6 +131,7 @@ def load_ticker(ticker: str):
     return fetch_ticker_data(ticker)
 
 
+# Cache network-heavy model calls; most inputs are stable enough for a one-hour app session.
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_factor_regression(
     tickers: tuple[str, ...],
@@ -136,6 +142,27 @@ def load_factor_regression(
     rebalancing_method: str,
 ):
     return analyze_fama_french_portfolio(tickers, weights, start_date, end_date, model_name, rebalancing_method)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_portfolio_analytics(
+    tickers: tuple[str, ...],
+    weights: tuple[float, ...] | None,
+    start_date: date,
+    end_date: date,
+    rebalancing_method: str,
+    benchmark_ticker: str,
+    risk_free_rate: float,
+):
+    return analyze_portfolio(
+        tickers,
+        weights,
+        start_date,
+        end_date,
+        rebalancing_method,
+        benchmark_ticker,
+        risk_free_rate,
+    )
 
 
 def money(value: float | None, currency: str = "USD") -> str:
@@ -179,6 +206,41 @@ def diagnostic_value(diagnostics: pd.DataFrame, metric: str):
     if row.empty:
         return None
     return row.iloc[0]["Value"]
+
+
+def metric_value(metrics: pd.DataFrame, metric: str):
+    row = metrics[metrics["Metric"].eq(metric)]
+    if row.empty:
+        return None
+    return row.iloc[0]["Value"]
+
+
+def format_metric_value(value: float | None, value_type: str, currency: str = "USD") -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    if value_type == "currency":
+        return compact_money(value, currency)
+    if value_type == "percent":
+        return pct(value)
+    if value_type == "multiple":
+        return f"{value:.1f}x"
+    if value_type == "number":
+        return f"{value:.2f}"
+    return str(value)
+
+
+def style_metric_table(df: pd.DataFrame, currency: str = "USD") -> pd.DataFrame:
+    # Backend metrics carry raw values and value types; the UI formats them at render time.
+    display = df.copy()
+    display["Value"] = display.apply(lambda row: format_metric_value(row["Value"], row["Type"], currency), axis=1)
+    return display.drop(columns=["Type"])
+
+
+def style_percent_frame(df: pd.DataFrame) -> pd.DataFrame:
+    display = df.copy()
+    for column in display.columns:
+        display[column] = display[column].map(lambda value: pct(value) if pd.notna(value) else "N/A")
+    return display
 
 
 def style_factor_coefficients(df: pd.DataFrame) -> pd.DataFrame:
@@ -375,6 +437,7 @@ def main() -> None:
     except DCFError as exc:
         st.error(str(exc))
         return
+    stock_metrics = calculate_stock_metrics(data, result, assumptions)
 
     with output_col:
         metric_1, metric_2, metric_3 = st.columns(3)
@@ -426,12 +489,44 @@ def main() -> None:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    tab_projection, tab_sensitivity, tab_history, tab_portfolio, tab_export = st.tabs(
-        ["Projection", "Sensitivity", "Historical data", "Portfolio Regression", "Export"]
+    # Keep single-stock valuation, portfolio risk, and factor regression in separate workflows.
+    (
+        tab_projection,
+        tab_stock_metrics,
+        tab_sensitivity,
+        tab_history,
+        tab_portfolio_analytics,
+        tab_portfolio,
+        tab_export,
+    ) = st.tabs(
+        [
+            "Projection",
+            "Valuation Metrics",
+            "Sensitivity",
+            "Historical data",
+            "Portfolio Analytics",
+            "Portfolio Regression",
+            "Export",
+        ]
     )
 
     with tab_projection:
         st.dataframe(style_projection(result.projection, data.currency), use_container_width=True, hide_index=True)
+
+    with tab_stock_metrics:
+        st.markdown("### Stock Valuation and Quality Metrics")
+        stock_metric_1, stock_metric_2, stock_metric_3, stock_metric_4, stock_metric_5 = st.columns(5)
+        stock_metric_1.metric("FCF yield", format_metric_value(metric_value(stock_metrics, "FCF yield"), "percent", data.currency))
+        stock_metric_2.metric("P/FCF", format_metric_value(metric_value(stock_metrics, "P/FCF"), "multiple", data.currency))
+        stock_metric_3.metric("ROIC", format_metric_value(metric_value(stock_metrics, "ROIC"), "percent", data.currency))
+        stock_metric_4.metric("ROIC spread", format_metric_value(metric_value(stock_metrics, "ROIC - WACC spread"), "percent", data.currency))
+        stock_metric_5.metric("Altman Z", format_metric_value(metric_value(stock_metrics, "Altman Z-score"), "number", data.currency))
+        st.dataframe(style_metric_table(stock_metrics, data.currency), use_container_width=True, hide_index=True)
+        st.markdown(
+            "<p class='small-note'>Metrics use the latest available annual statements and market price. "
+            "Some formulas show N/A when Yahoo Finance does not provide the needed input.</p>",
+            unsafe_allow_html=True,
+        )
 
     with tab_sensitivity:
         formatted_sensitivity = sensitivity.map(lambda value: money(value, data.currency) if pd.notna(value) else "N/A")
@@ -439,6 +534,225 @@ def main() -> None:
 
     with tab_history:
         st.dataframe(style_history(data.financial_history, data.currency), use_container_width=True, hide_index=True)
+
+    with tab_portfolio_analytics:
+        st.markdown("### Portfolio Performance and Risk")
+        with st.form("portfolio-analytics-form", border=False):
+            input_col_1, input_col_2 = st.columns([0.55, 0.45])
+            with input_col_1:
+                analytics_tickers = st.text_input(
+                    "Portfolio tickers",
+                    value="AAPL, MSFT, NVDA",
+                    key="analytics_portfolio_tickers",
+                )
+                analytics_weights = st.text_input(
+                    "Weights",
+                    value="",
+                    help="Leave blank for equal weights, or enter values like 40, 40, 20.",
+                    key="analytics_portfolio_weights",
+                )
+                analytics_rebalancing = st.radio(
+                    "Rebalancing method",
+                    ["Monthly rebalance", "Buy and hold"],
+                    horizontal=True,
+                    key="analytics_rebalancing_method",
+                )
+            with input_col_2:
+                analytics_benchmark = st.text_input("Benchmark", value="SPY", key="analytics_benchmark")
+                analytics_risk_free = st.number_input(
+                    "Risk-free rate",
+                    min_value=0.0,
+                    max_value=20.0,
+                    value=4.0,
+                    step=0.25,
+                    format="%.2f",
+                    key="analytics_risk_free",
+                )
+                analytics_start_date = st.date_input(
+                    "Start date",
+                    value=date(2020, 1, 1),
+                    min_value=date(1980, 1, 1),
+                    key="analytics_start_date",
+                )
+                analytics_end_date = st.date_input(
+                    "End date",
+                    value=date.today(),
+                    min_value=date(1980, 1, 1),
+                    key="analytics_end_date",
+                )
+                run_analytics = st.form_submit_button("Run Portfolio Analytics", use_container_width=True)
+
+        if not run_analytics:
+            st.markdown(
+                "<p class='small-note'>Run this to calculate CAGR, volatility, Sharpe, Sortino, drawdown, beta, "
+                "Jensen alpha, Treynor, information ratio, VaR, CVaR, correlation, risk contribution, and an efficient frontier.</p>",
+                unsafe_allow_html=True,
+            )
+        else:
+            try:
+                tickers = parse_tickers(analytics_tickers)
+                weights = parse_weights(analytics_weights)
+                with st.spinner("Loading prices and calculating portfolio analytics..."):
+                    analytics = load_portfolio_analytics(
+                        tickers,
+                        weights,
+                        analytics_start_date,
+                        analytics_end_date,
+                        analytics_rebalancing,
+                        analytics_benchmark,
+                        analytics_risk_free / 100,
+                    )
+            except (PortfolioAnalyticsError, FactorRegressionError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                metric_cagr, metric_vol, metric_sharpe, metric_drawdown, metric_beta = st.columns(5)
+                metric_cagr.metric("CAGR", format_metric_value(metric_value(analytics.metrics, "CAGR"), "percent"))
+                metric_vol.metric("Volatility", format_metric_value(metric_value(analytics.metrics, "Annualized volatility"), "percent"))
+                metric_sharpe.metric("Sharpe", format_metric_value(metric_value(analytics.metrics, "Sharpe ratio"), "number"))
+                metric_drawdown.metric("Max drawdown", format_metric_value(metric_value(analytics.metrics, "Maximum drawdown"), "percent"))
+                metric_beta.metric("Beta", format_metric_value(metric_value(analytics.metrics, "Beta"), "number"))
+
+                portfolio_chart_col, drawdown_chart_col = st.columns([0.55, 0.45], gap="large")
+                with portfolio_chart_col:
+                    cumulative = analytics.cumulative_returns.reset_index(names="Month").melt(
+                        id_vars="Month",
+                        var_name="Series",
+                        value_name="Cumulative return",
+                    )
+                    cumulative_fig = px.line(
+                        cumulative,
+                        x="Month",
+                        y="Cumulative return",
+                        color="Series",
+                        color_discrete_sequence=["#176b64", "#4b5f8f", "#9a5b1f"],
+                    )
+                    cumulative_fig.update_layout(
+                        height=320,
+                        margin=dict(l=10, r=10, t=20, b=10),
+                        paper_bgcolor="#ffffff",
+                        plot_bgcolor="#ffffff",
+                        legend_title_text="",
+                        yaxis_tickformat=".0%",
+                    )
+                    st.plotly_chart(cumulative_fig, use_container_width=True)
+                with drawdown_chart_col:
+                    drawdowns = analytics.drawdowns.reset_index(names="Month").melt(
+                        id_vars="Month",
+                        var_name="Series",
+                        value_name="Drawdown",
+                    )
+                    drawdown_fig = px.area(
+                        drawdowns,
+                        x="Month",
+                        y="Drawdown",
+                        color="Series",
+                        color_discrete_sequence=["#176b64", "#4b5f8f", "#9a5b1f"],
+                    )
+                    drawdown_fig.update_layout(
+                        height=320,
+                        margin=dict(l=10, r=10, t=20, b=10),
+                        paper_bgcolor="#ffffff",
+                        plot_bgcolor="#ffffff",
+                        legend_title_text="",
+                        yaxis_tickformat=".0%",
+                    )
+                    st.plotly_chart(drawdown_fig, use_container_width=True)
+
+                analytics_tab_1, analytics_tab_2, analytics_tab_3, analytics_tab_4, analytics_tab_5, analytics_tab_6 = st.tabs(
+                    ["Metrics", "Correlation", "Risk contribution", "Efficient frontier", "Monthly returns", "Export analytics"]
+                )
+                with analytics_tab_1:
+                    st.dataframe(style_metric_table(analytics.metrics), use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        style_weight_table(
+                            analytics.weights,
+                            analytics.ending_weights,
+                            analytics.rebalancing_method == "Buy and hold",
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                with analytics_tab_2:
+                    corr_fig = px.imshow(
+                        analytics.correlation,
+                        text_auto=".2f",
+                        color_continuous_scale=["#9a5b1f", "#f3f6f4", "#176b64"],
+                        zmin=-1,
+                        zmax=1,
+                    )
+                    corr_fig.update_layout(
+                        height=420,
+                        margin=dict(l=10, r=10, t=20, b=10),
+                        paper_bgcolor="#ffffff",
+                        plot_bgcolor="#ffffff",
+                    )
+                    st.plotly_chart(corr_fig, use_container_width=True)
+                    st.dataframe(analytics.correlation.round(3), use_container_width=True)
+                with analytics_tab_3:
+                    risk_fig = px.bar(
+                        analytics.risk_contribution,
+                        x="Ticker",
+                        y="Risk contribution",
+                        color="Risk contribution",
+                        color_continuous_scale=["#9a5b1f", "#f3f6f4", "#176b64"],
+                    )
+                    risk_fig.update_layout(
+                        height=360,
+                        margin=dict(l=10, r=10, t=20, b=10),
+                        paper_bgcolor="#ffffff",
+                        plot_bgcolor="#ffffff",
+                        coloraxis_showscale=False,
+                        yaxis_tickformat=".0%",
+                    )
+                    st.plotly_chart(risk_fig, use_container_width=True)
+                    risk_display = analytics.risk_contribution.copy()
+                    risk_display["Weight"] = risk_display["Weight"].map(pct)
+                    risk_display["Risk contribution"] = risk_display["Risk contribution"].map(pct)
+                    st.dataframe(risk_display, use_container_width=True, hide_index=True)
+                with analytics_tab_4:
+                    frontier = analytics.efficient_frontier.copy()
+                    weight_columns = [column for column in frontier.columns if column.endswith(" weight")]
+                    frontier_fig = px.scatter(
+                        frontier,
+                        x="Annualized volatility",
+                        y="Annualized return",
+                        color="Portfolio",
+                        hover_data=["Sharpe ratio"] + weight_columns,
+                        color_discrete_map={
+                            "Sample": "#aab5b2",
+                            "Current": "#176b64",
+                            "Max Sharpe": "#4b5f8f",
+                            "Min Volatility": "#9a5b1f",
+                        },
+                    )
+                    frontier_fig.update_layout(
+                        height=430,
+                        margin=dict(l=10, r=10, t=20, b=10),
+                        paper_bgcolor="#ffffff",
+                        plot_bgcolor="#ffffff",
+                        xaxis_tickformat=".0%",
+                        yaxis_tickformat=".0%",
+                    )
+                    st.plotly_chart(frontier_fig, use_container_width=True)
+                    frontier_display = frontier[frontier["Portfolio"].ne("Sample")].copy()
+                    for column in ["Annualized return", "Annualized volatility"]:
+                        frontier_display[column] = frontier_display[column].map(pct)
+                    frontier_display["Sharpe ratio"] = frontier_display["Sharpe ratio"].map(lambda value: f"{value:.2f}" if pd.notna(value) else "N/A")
+                    for column in weight_columns:
+                        frontier_display[column] = frontier_display[column].map(pct)
+                    st.dataframe(frontier_display, use_container_width=True, hide_index=True)
+                with analytics_tab_5:
+                    st.dataframe(style_percent_frame(analytics.monthly_returns), use_container_width=True)
+                with analytics_tab_6:
+                    st.download_button(
+                        "Download Portfolio Analytics CSV",
+                        data=portfolio_analytics_csv(analytics),
+                        file_name="portfolio_analytics.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                    notes = " ".join(analytics.price_source_notes)
+                    st.markdown(f"<p class='small-note'>{notes}</p>", unsafe_allow_html=True)
 
     with tab_portfolio:
         st.markdown("### Fama-French Portfolio Regression")

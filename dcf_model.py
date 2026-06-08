@@ -16,6 +16,8 @@ REVENUE_ROWS = (
     "Operating Revenue",
 )
 
+# Yahoo Finance and SEC statements use slightly different row/tag names.
+# These aliases keep the app tolerant of common statement naming differences.
 FREE_CASH_FLOW_ROWS = (
     "Free Cash Flow",
     "FreeCashFlow",
@@ -53,11 +55,72 @@ SHARES_ROWS = (
     "Common Stock Shares Outstanding",
 )
 
+NET_INCOME_ROWS = (
+    "Net Income",
+    "Net Income Common Stockholders",
+    "Net Income Continuous Operations",
+)
+
+PRETAX_INCOME_ROWS = (
+    "Pretax Income",
+    "Income Before Tax",
+    "Earnings Before Tax",
+)
+
+TAX_PROVISION_ROWS = (
+    "Tax Provision",
+    "Income Tax Expense",
+)
+
+EBIT_ROWS = (
+    "EBIT",
+    "Earnings Before Interest And Taxes",
+    "Operating Income",
+    "Operating Income Loss",
+)
+
+EBITDA_ROWS = (
+    "EBITDA",
+    "Normalized EBITDA",
+)
+
+TOTAL_EQUITY_ROWS = (
+    "Stockholders Equity",
+    "Total Equity Gross Minority Interest",
+    "Common Stock Equity",
+    "Total Stockholder Equity",
+)
+
+TOTAL_ASSETS_ROWS = (
+    "Total Assets",
+)
+
+TOTAL_LIABILITIES_ROWS = (
+    "Total Liabilities Net Minority Interest",
+    "Total Liab",
+    "Total Liabilities",
+)
+
+CURRENT_ASSETS_ROWS = (
+    "Current Assets",
+    "Total Current Assets",
+)
+
+CURRENT_LIABILITIES_ROWS = (
+    "Current Liabilities",
+    "Total Current Liabilities",
+)
+
+RETAINED_EARNINGS_ROWS = (
+    "Retained Earnings",
+)
+
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 SEC_DEFAULT_USER_AGENT = "dcf-valuation-streamlit-app/1.0 contact@example.com"
 
 FAMA_FRENCH_DATASETS = {
+    # Official Kenneth French monthly factor datasets, downloaded as CSV ZIP files.
     "Fama-French 3 Factor": {
         "url": "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip",
         "factors": ("Mkt-RF", "SMB", "HML"),
@@ -127,6 +190,22 @@ class TickerData:
     total_debt: float
     financial_history: pd.DataFrame
     source_notes: tuple[str, ...]
+    market_cap: float | None = None
+    net_income: float | None = None
+    pretax_income: float | None = None
+    tax_provision: float | None = None
+    ebit: float | None = None
+    ebitda: float | None = None
+    total_equity: float | None = None
+    total_assets: float | None = None
+    total_liabilities: float | None = None
+    current_assets: float | None = None
+    current_liabilities: float | None = None
+    retained_earnings: float | None = None
+    trailing_eps: float | None = None
+    forward_eps: float | None = None
+    dividend_rate: float | None = None
+    beta: float | None = None
 
 
 @dataclass(frozen=True)
@@ -171,12 +250,34 @@ class FactorRegressionResult:
     factor_source_note: str
 
 
+@dataclass(frozen=True)
+class PortfolioAnalyticsResult:
+    tickers: tuple[str, ...]
+    benchmark_ticker: str
+    rebalancing_method: str
+    risk_free_rate: float
+    weights: pd.Series
+    ending_weights: pd.Series
+    metrics: pd.DataFrame
+    cumulative_returns: pd.DataFrame
+    drawdowns: pd.DataFrame
+    correlation: pd.DataFrame
+    risk_contribution: pd.DataFrame
+    efficient_frontier: pd.DataFrame
+    monthly_returns: pd.DataFrame
+    price_source_notes: tuple[str, ...]
+
+
 class DCFError(ValueError):
     """Raised when the valuation cannot be calculated from the available data."""
 
 
 class FactorRegressionError(ValueError):
     """Raised when portfolio factor regression cannot be calculated."""
+
+
+class PortfolioAnalyticsError(ValueError):
+    """Raised when portfolio analytics cannot be calculated."""
 
 
 def normalize_ticker(raw_ticker: str) -> str:
@@ -226,6 +327,25 @@ def fetch_ticker_data(raw_ticker: str) -> TickerData:
     if debt == 0.0 and sec_data is not None:
         debt = sec_data["total_debt"] or 0.0
 
+    # Extra statement fields are optional. When Yahoo omits them, downstream metrics render as N/A.
+    market_cap = _number_from_mapping(fast_info, ("market_cap", "marketCap"))
+    if market_cap is None:
+        market_cap = _number_from_mapping(info, ("marketCap",))
+    if market_cap is None and current_price is not None and shares is not None:
+        market_cap = current_price * shares
+
+    net_income = _latest_statement_value(financials, NET_INCOME_ROWS)
+    pretax_income = _latest_statement_value(financials, PRETAX_INCOME_ROWS)
+    tax_provision = _latest_statement_value(financials, TAX_PROVISION_ROWS)
+    ebit = _latest_statement_value(financials, EBIT_ROWS)
+    ebitda = _latest_statement_value(financials, EBITDA_ROWS)
+    total_equity = _latest_statement_value(balance_sheet, TOTAL_EQUITY_ROWS)
+    total_assets = _latest_statement_value(balance_sheet, TOTAL_ASSETS_ROWS)
+    total_liabilities = _latest_statement_value(balance_sheet, TOTAL_LIABILITIES_ROWS)
+    current_assets = _latest_statement_value(balance_sheet, CURRENT_ASSETS_ROWS)
+    current_liabilities = _latest_statement_value(balance_sheet, CURRENT_LIABILITIES_ROWS)
+    retained_earnings = _latest_statement_value(balance_sheet, RETAINED_EARNINGS_ROWS)
+
     notes: list[str] = []
     if sec_data is not None:
         notes.append("Annual financial statement data loaded from SEC EDGAR company facts.")
@@ -250,6 +370,22 @@ def fetch_ticker_data(raw_ticker: str) -> TickerData:
         total_debt=float(debt),
         financial_history=history,
         source_notes=tuple(notes),
+        market_cap=market_cap,
+        net_income=net_income,
+        pretax_income=pretax_income,
+        tax_provision=tax_provision,
+        ebit=ebit,
+        ebitda=ebitda,
+        total_equity=total_equity,
+        total_assets=total_assets,
+        total_liabilities=total_liabilities,
+        current_assets=current_assets,
+        current_liabilities=current_liabilities,
+        retained_earnings=retained_earnings,
+        trailing_eps=_clean_number(info.get("trailingEps")),
+        forward_eps=_clean_number(info.get("forwardEps")),
+        dividend_rate=_clean_number(info.get("dividendRate")),
+        beta=_clean_number(info.get("beta")),
     )
 
 
@@ -518,6 +654,338 @@ def summary_csv(result: DCFResult, sensitivity: pd.DataFrame) -> bytes:
         result.projection.to_csv(index=False),
         "\nSensitivity",
         sensitivity.to_csv(),
+    ]
+    return "\n".join(parts).encode("utf-8")
+
+
+def calculate_stock_metrics(
+    data: TickerData,
+    result: DCFResult,
+    assumptions: DCFAssumptions,
+) -> pd.DataFrame:
+    # Build one normalized metrics table so Streamlit can display formulas and values together.
+    market_cap = data.market_cap
+    if market_cap is None and data.current_price is not None and data.shares_outstanding is not None:
+        market_cap = data.current_price * data.shares_outstanding
+    market_enterprise_value = market_cap + data.total_debt - data.cash_and_equivalents if market_cap is not None else None
+    latest_revenue = _latest_positive(data.financial_history["revenue"]) if "revenue" in data.financial_history else None
+    latest_fcf = _latest_positive(data.financial_history["free_cash_flow"]) if "free_cash_flow" in data.financial_history else None
+    revenue_cagr = _historical_cagr(data.financial_history["revenue"]) if "revenue" in data.financial_history else None
+    fcf_cagr = _historical_cagr(data.financial_history["free_cash_flow"]) if "free_cash_flow" in data.financial_history else None
+    fcf_margin = _recent_median(data.financial_history.get("fcf_margin", pd.Series(dtype=float)))
+
+    tax_rate = _safe_divide(data.tax_provision, data.pretax_income)
+    if tax_rate is None or tax_rate < 0 or tax_rate > 0.6:
+        tax_rate = 0.21
+    nopat = data.ebit * (1 - tax_rate) if data.ebit is not None else None
+    invested_capital = None
+    if data.total_equity is not None:
+        invested_capital = data.total_equity + data.total_debt - data.cash_and_equivalents
+        if invested_capital <= 0:
+            invested_capital = None
+
+    roic = _safe_divide(nopat, invested_capital)
+    roe = _safe_divide(data.net_income, data.total_equity)
+    net_margin = _safe_divide(data.net_income, latest_revenue)
+    asset_turnover = _safe_divide(latest_revenue, data.total_assets)
+    equity_multiplier = _safe_divide(data.total_assets, data.total_equity)
+    dupont_roe = None
+    if net_margin is not None and asset_turnover is not None and equity_multiplier is not None:
+        dupont_roe = net_margin * asset_turnover * equity_multiplier
+
+    residual_income_value = None
+    if data.total_equity is not None and data.net_income is not None and assumptions.wacc > assumptions.terminal_growth_rate:
+        equity_charge = data.total_equity * assumptions.wacc
+        residual_income = data.net_income - equity_charge
+        residual_income_value = data.total_equity + residual_income * (1 + assumptions.terminal_growth_rate) / (
+            assumptions.wacc - assumptions.terminal_growth_rate
+        )
+
+    ddm_value_per_share = None
+    if (
+        data.dividend_rate is not None
+        and data.dividend_rate > 0
+        and assumptions.wacc > assumptions.terminal_growth_rate
+    ):
+        ddm_value_per_share = data.dividend_rate * (1 + assumptions.terminal_growth_rate) / (
+            assumptions.wacc - assumptions.terminal_growth_rate
+        )
+
+    working_capital = None
+    if data.current_assets is not None and data.current_liabilities is not None:
+        working_capital = data.current_assets - data.current_liabilities
+    altman_z = None
+    if (
+        working_capital is not None
+        and data.retained_earnings is not None
+        and data.ebit is not None
+        and data.total_assets is not None
+        and data.total_assets > 0
+        and data.total_liabilities is not None
+        and data.total_liabilities > 0
+        and market_cap is not None
+        and latest_revenue is not None
+    ):
+        altman_z = (
+            1.2 * working_capital / data.total_assets
+            + 1.4 * data.retained_earnings / data.total_assets
+            + 3.3 * data.ebit / data.total_assets
+            + 0.6 * market_cap / data.total_liabilities
+            + latest_revenue / data.total_assets
+        )
+
+    pe = _safe_divide(data.current_price, data.trailing_eps)
+    if pe is None:
+        pe = _safe_divide(market_cap, data.net_income)
+    rows = [
+        _metric_row("Valuation", "Market cap", market_cap, "currency", "Price x shares outstanding", ""),
+        _metric_row("Valuation", "Enterprise value", market_enterprise_value, "currency", "Market cap + debt - cash", ""),
+        _metric_row("Valuation", "P/E", pe, "multiple", "Price / EPS or market cap / net income", ""),
+        _metric_row("Valuation", "Forward P/E", _safe_divide(data.current_price, data.forward_eps), "multiple", "Price / forward EPS", ""),
+        _metric_row("Valuation", "P/S", _safe_divide(market_cap, latest_revenue), "multiple", "Market cap / revenue", ""),
+        _metric_row("Valuation", "EV/EBITDA", _safe_divide(market_enterprise_value, data.ebitda), "multiple", "Enterprise value / EBITDA", ""),
+        _metric_row("Valuation", "P/FCF", _safe_divide(market_cap, latest_fcf), "multiple", "Market cap / free cash flow", ""),
+        _metric_row("Valuation", "FCF yield", _safe_divide(latest_fcf, market_cap), "percent", "Free cash flow / market cap", ""),
+        _metric_row("Valuation", "Earnings yield", _safe_divide(data.net_income, market_cap), "percent", "Net income / market cap", ""),
+        _metric_row("Valuation", "DCF upside", result.upside_to_intrinsic, "percent", "Intrinsic value / current price - 1", ""),
+        _metric_row("Dividend", "Dividend yield", _safe_divide(data.dividend_rate, data.current_price), "percent", "Dividend per share / price", ""),
+        _metric_row("Dividend", "DDM value / share", ddm_value_per_share, "currency", "Next dividend / (WACC - terminal growth)", "Uses WACC as a practical cost-of-equity proxy."),
+        _metric_row("Quality", "Revenue CAGR", revenue_cagr, "percent", "Historical revenue compound annual growth", ""),
+        _metric_row("Quality", "FCF CAGR", fcf_cagr, "percent", "Historical free cash flow compound annual growth", ""),
+        _metric_row("Quality", "FCF margin", fcf_margin, "percent", "Free cash flow / revenue", "Uses recent median margin."),
+        _metric_row("Quality", "ROIC", roic, "percent", "NOPAT / invested capital", "NOPAT uses reported EBIT and an estimated tax rate."),
+        _metric_row("Quality", "ROIC - WACC spread", roic - assumptions.wacc if roic is not None else None, "percent", "ROIC - WACC", ""),
+        _metric_row("Quality", "EVA", nopat - invested_capital * assumptions.wacc if nopat is not None and invested_capital is not None else None, "currency", "NOPAT - invested capital x WACC", ""),
+        _metric_row("Quality", "ROE", roe, "percent", "Net income / book equity", ""),
+        _metric_row("Quality", "DuPont ROE", dupont_roe, "percent", "Net margin x asset turnover x equity multiplier", ""),
+        _metric_row("Balance sheet", "Debt / market cap", _safe_divide(data.total_debt, market_cap), "percent", "Total debt / market cap", ""),
+        _metric_row("Balance sheet", "Net cash / market cap", _safe_divide(data.cash_and_equivalents - data.total_debt, market_cap), "percent", "(Cash - debt) / market cap", ""),
+        _metric_row("Balance sheet", "Altman Z-score", altman_z, "number", "1.2 WC/TA + 1.4 RE/TA + 3.3 EBIT/TA + 0.6 MVE/TL + sales/TA", "Classic public-company Z-score; less useful for financial companies."),
+        _metric_row("Residual income", "Residual income value / share", _safe_divide(residual_income_value, data.shares_outstanding), "currency", "Book equity + PV residual income, divided by shares", "Uses WACC and terminal growth from the DCF assumptions."),
+        _metric_row("Market risk", "Yahoo beta", data.beta, "number", "Reported beta from Yahoo Finance", ""),
+    ]
+    return pd.DataFrame(rows)
+
+
+def analyze_portfolio(
+    tickers: Iterable[str],
+    weights: Iterable[float] | None,
+    start,
+    end,
+    rebalancing_method: str = "Monthly rebalance",
+    benchmark_ticker: str = "SPY",
+    risk_free_rate: float = 0.04,
+) -> PortfolioAnalyticsResult:
+    # Portfolio analytics use monthly returns to match the Fama-French regression horizon.
+    tickers = tuple(normalize_ticker(ticker) for ticker in tickers if str(ticker).strip())
+    if not tickers:
+        raise PortfolioAnalyticsError("Enter at least one ticker.")
+    if pd.Timestamp(start) >= pd.Timestamp(end):
+        raise PortfolioAnalyticsError("Start date must be before end date.")
+
+    weight_series = normalize_portfolio_weights(tickers, weights)
+    rebalancing_method = normalize_rebalancing_method(rebalancing_method)
+    ticker_returns, source_notes = fetch_portfolio_monthly_returns(tickers, start, end)
+    ticker_returns = ticker_returns.dropna(how="any")
+    if ticker_returns.empty:
+        raise PortfolioAnalyticsError("No overlapping monthly return history was available for the selected tickers.")
+
+    portfolio_returns, ending_weights = build_portfolio_returns(ticker_returns, weight_series, rebalancing_method)
+    portfolio_returns = portfolio_returns.dropna()
+    benchmark_ticker = normalize_ticker(benchmark_ticker or "SPY")
+    benchmark_returns = pd.Series(dtype=float, name=benchmark_ticker)
+    try:
+        benchmark_prices, benchmark_source = fetch_price_history(benchmark_ticker, start, end)
+        benchmark_returns = benchmark_prices.resample("ME").last().dropna().pct_change().dropna().rename(benchmark_ticker)
+        source_notes.append(f"{benchmark_ticker}: {benchmark_source}.")
+    except FactorRegressionError:
+        source_notes.append(f"{benchmark_ticker}: benchmark history was not available.")
+
+    metrics = portfolio_performance_metrics(portfolio_returns, benchmark_returns, risk_free_rate, benchmark_ticker)
+    cumulative_returns = build_cumulative_returns(portfolio_returns, benchmark_returns, benchmark_ticker)
+    drawdowns = build_drawdowns(cumulative_returns)
+    correlation = ticker_returns.corr()
+    risk_contribution = portfolio_risk_contribution(ticker_returns, weight_series, ending_weights, rebalancing_method)
+    frontier = efficient_frontier(ticker_returns, weight_series, risk_free_rate)
+
+    return PortfolioAnalyticsResult(
+        tickers=tickers,
+        benchmark_ticker=benchmark_ticker,
+        rebalancing_method=rebalancing_method,
+        risk_free_rate=float(risk_free_rate),
+        weights=weight_series,
+        ending_weights=ending_weights,
+        metrics=metrics,
+        cumulative_returns=cumulative_returns,
+        drawdowns=drawdowns,
+        correlation=correlation,
+        risk_contribution=risk_contribution,
+        efficient_frontier=frontier,
+        monthly_returns=ticker_returns.assign(portfolio_return=portfolio_returns),
+        price_source_notes=tuple(source_notes),
+    )
+
+
+def portfolio_performance_metrics(
+    portfolio_returns: pd.Series,
+    benchmark_returns: pd.Series | None,
+    risk_free_rate: float,
+    benchmark_name: str = "Benchmark",
+) -> pd.DataFrame:
+    portfolio_returns = pd.to_numeric(portfolio_returns, errors="coerce").dropna()
+    if portfolio_returns.empty:
+        raise PortfolioAnalyticsError("Portfolio returns were empty.")
+
+    annual_return = _annualized_return(portfolio_returns)
+    annual_volatility = _annualized_volatility(portfolio_returns)
+    downside_volatility = _downside_volatility(portfolio_returns, risk_free_rate)
+    max_drawdown = _max_drawdown(portfolio_returns)
+    monthly_var = _historical_var(portfolio_returns, 0.95)
+    monthly_cvar = _historical_cvar(portfolio_returns, 0.95)
+    positive_months = float((portfolio_returns > 0).mean())
+
+    beta = None
+    jensen_alpha = None
+    treynor = None
+    information_ratio = None
+    benchmark_return = None
+    if benchmark_returns is not None and not benchmark_returns.empty:
+        aligned = pd.concat([portfolio_returns.rename("portfolio"), benchmark_returns.rename("benchmark")], axis=1).dropna()
+        if len(aligned) > 1 and aligned["benchmark"].var() > 0:
+            beta = float(aligned["portfolio"].cov(aligned["benchmark"]) / aligned["benchmark"].var())
+            benchmark_return = _annualized_return(aligned["benchmark"])
+            jensen_alpha = annual_return - (risk_free_rate + beta * (benchmark_return - risk_free_rate))
+            if beta != 0:
+                treynor = (annual_return - risk_free_rate) / beta
+            active_returns = aligned["portfolio"] - aligned["benchmark"]
+            tracking_error = active_returns.std(ddof=1) * np.sqrt(12)
+            if tracking_error > 0:
+                information_ratio = active_returns.mean() * 12 / tracking_error
+
+    rows = [
+        _metric_row("Return", "CAGR", annual_return, "percent", "(Ending value / beginning value)^(1 / years) - 1", ""),
+        _metric_row("Return", "Cumulative return", float((1 + portfolio_returns).prod() - 1), "percent", "Total compounded portfolio return", ""),
+        _metric_row("Return", "Best month", float(portfolio_returns.max()), "percent", "Highest monthly return", ""),
+        _metric_row("Return", "Worst month", float(portfolio_returns.min()), "percent", "Lowest monthly return", ""),
+        _metric_row("Return", "Positive months", positive_months, "percent", "Share of months above 0%", ""),
+        _metric_row("Risk", "Annualized volatility", annual_volatility, "percent", "Monthly return standard deviation x sqrt(12)", ""),
+        _metric_row("Risk", "Downside volatility", downside_volatility, "percent", "Downside deviation x sqrt(12)", ""),
+        _metric_row("Risk", "Maximum drawdown", max_drawdown, "percent", "Worst peak-to-trough decline", ""),
+        _metric_row("Risk", "Monthly VaR 95%", monthly_var, "percent", "Historical 5th percentile loss", ""),
+        _metric_row("Risk", "Monthly CVaR 95%", monthly_cvar, "percent", "Average loss beyond VaR", ""),
+        _metric_row("Risk-adjusted", "Sharpe ratio", _safe_divide(annual_return - risk_free_rate, annual_volatility), "number", "(CAGR - risk-free rate) / volatility", ""),
+        _metric_row("Risk-adjusted", "Sortino ratio", _safe_divide(annual_return - risk_free_rate, downside_volatility), "number", "(CAGR - risk-free rate) / downside volatility", ""),
+        _metric_row("Benchmark", f"{benchmark_name} CAGR", benchmark_return, "percent", "Benchmark compounded annual return", ""),
+        _metric_row("Benchmark", "Beta", beta, "number", "Covariance(portfolio, benchmark) / variance(benchmark)", ""),
+        _metric_row("Benchmark", "Jensen alpha", jensen_alpha, "percent", "CAGR - [risk-free + beta x benchmark risk premium]", ""),
+        _metric_row("Benchmark", "Treynor ratio", treynor, "number", "(CAGR - risk-free rate) / beta", ""),
+        _metric_row("Benchmark", "Information ratio", information_ratio, "number", "Annualized active return / tracking error", ""),
+        _metric_row("Data", "Monthly observations", float(len(portfolio_returns)), "number", "Number of monthly return observations", ""),
+    ]
+    return pd.DataFrame(rows)
+
+
+def build_cumulative_returns(
+    portfolio_returns: pd.Series,
+    benchmark_returns: pd.Series | None,
+    benchmark_name: str,
+) -> pd.DataFrame:
+    curves = {"Portfolio": (1 + portfolio_returns.dropna()).cumprod() - 1}
+    if benchmark_returns is not None and not benchmark_returns.empty:
+        curves[benchmark_name] = (1 + benchmark_returns.dropna()).cumprod() - 1
+    return pd.concat(curves, axis=1).dropna(how="all")
+
+
+def build_drawdowns(cumulative_returns: pd.DataFrame) -> pd.DataFrame:
+    wealth = 1 + cumulative_returns
+    peaks = wealth.cummax()
+    return wealth / peaks - 1
+
+
+def portfolio_risk_contribution(
+    ticker_returns: pd.DataFrame,
+    starting_weights: pd.Series,
+    ending_weights: pd.Series,
+    rebalancing_method: str,
+) -> pd.DataFrame:
+    effective_weights = starting_weights if rebalancing_method == "Monthly rebalance" else ending_weights
+    effective_weights = effective_weights.reindex(ticker_returns.columns).fillna(0.0)
+    covariance = ticker_returns.cov() * 12
+    portfolio_variance = float(effective_weights.to_numpy() @ covariance.to_numpy() @ effective_weights.to_numpy())
+    if portfolio_variance <= 0:
+        contribution = pd.Series(0.0, index=ticker_returns.columns)
+    else:
+        marginal = covariance.dot(effective_weights)
+        contribution = effective_weights * marginal / portfolio_variance
+    return pd.DataFrame(
+        {
+            "Ticker": ticker_returns.columns,
+            "Weight": effective_weights.to_numpy(),
+            "Risk contribution": contribution.reindex(ticker_returns.columns).to_numpy(),
+        }
+    )
+
+
+def efficient_frontier(
+    ticker_returns: pd.DataFrame,
+    current_weights: pd.Series,
+    risk_free_rate: float,
+    samples: int = 1500,
+) -> pd.DataFrame:
+    # Use a fixed seed so the efficient-frontier chart is stable across app reruns.
+    tickers = tuple(ticker_returns.columns)
+    if not tickers:
+        return pd.DataFrame()
+
+    expected_returns = ticker_returns.mean() * 12
+    covariance = ticker_returns.cov() * 12
+    current = current_weights.reindex(tickers).fillna(0.0).to_numpy(dtype=float)
+    current = current / current.sum() if current.sum() > 0 else np.repeat(1 / len(tickers), len(tickers))
+    rng = np.random.default_rng(42)
+    random_weights = rng.dirichlet(np.ones(len(tickers)), size=samples) if len(tickers) > 1 else current.reshape(1, -1)
+    all_weights = np.vstack([current, random_weights])
+
+    rows: list[dict[str, float | str]] = []
+    for idx, weights in enumerate(all_weights):
+        annual_return = float(weights @ expected_returns.to_numpy())
+        annual_volatility = float(np.sqrt(max(weights @ covariance.to_numpy() @ weights, 0)))
+        sharpe = _safe_divide(annual_return - risk_free_rate, annual_volatility)
+        row: dict[str, float | str] = {
+            "Portfolio": "Current" if idx == 0 else "Sample",
+            "Annualized return": annual_return,
+            "Annualized volatility": annual_volatility,
+            "Sharpe ratio": sharpe,
+        }
+        for ticker, weight in zip(tickers, weights):
+            row[f"{ticker} weight"] = float(weight)
+        rows.append(row)
+
+    frontier = pd.DataFrame(rows)
+    sample_rows = frontier[frontier["Portfolio"].eq("Sample")]
+    if not sample_rows.empty:
+        max_sharpe_idx = sample_rows["Sharpe ratio"].astype(float).idxmax()
+        min_vol_idx = sample_rows["Annualized volatility"].astype(float).idxmin()
+        frontier.loc[max_sharpe_idx, "Portfolio"] = "Max Sharpe"
+        frontier.loc[min_vol_idx, "Portfolio"] = "Min Volatility"
+    return frontier
+
+
+def portfolio_analytics_csv(result: PortfolioAnalyticsResult) -> bytes:
+    parts = [
+        "Metrics",
+        result.metrics.to_csv(index=False),
+        "\nStarting weights",
+        result.weights.rename_axis("Ticker").reset_index().to_csv(index=False),
+        "\nEnding weights",
+        result.ending_weights.rename_axis("Ticker").reset_index().to_csv(index=False),
+        "\nRisk contribution",
+        result.risk_contribution.to_csv(index=False),
+        "\nCorrelation",
+        result.correlation.to_csv(),
+        "\nEfficient frontier",
+        result.efficient_frontier.to_csv(index=False),
+        "\nMonthly returns",
+        result.monthly_returns.to_csv(),
     ]
     return "\n".join(parts).encode("utf-8")
 
@@ -995,6 +1463,7 @@ def _combine_cfo_and_capex(cfo: float, capex: float) -> float:
 
 
 def _current_price(stock, fast_info, ticker: str) -> float | None:
+    # Try lightweight quote fields first, then progressively fall back to recent price history.
     for key in ("last_price", "lastPrice", "regularMarketPrice", "previousClose"):
         value = _mapping_get(fast_info, key)
         cleaned = _clean_number(value)
@@ -1106,6 +1575,73 @@ def _clean_number(value) -> float | None:
     if not np.isfinite(number):
         return None
     return number
+
+
+def _safe_divide(numerator, denominator) -> float | None:
+    numerator = _clean_number(numerator)
+    denominator = _clean_number(denominator)
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def _metric_row(category: str, metric: str, value, value_type: str, formula: str, notes: str) -> dict[str, object]:
+    return {
+        "Category": category,
+        "Metric": metric,
+        "Value": _clean_number(value),
+        "Type": value_type,
+        "Formula": formula,
+        "Notes": notes,
+    }
+
+
+def _annualized_return(returns: pd.Series) -> float:
+    returns = pd.to_numeric(returns, errors="coerce").dropna()
+    compounded = float((1 + returns).prod())
+    years = len(returns) / 12
+    if compounded <= 0 or years <= 0:
+        return -1.0
+    return compounded ** (1 / years) - 1
+
+
+def _annualized_volatility(returns: pd.Series) -> float | None:
+    returns = pd.to_numeric(returns, errors="coerce").dropna()
+    if len(returns) < 2:
+        return None
+    return float(returns.std(ddof=1) * np.sqrt(12))
+
+
+def _downside_volatility(returns: pd.Series, risk_free_rate: float) -> float | None:
+    returns = pd.to_numeric(returns, errors="coerce").dropna()
+    monthly_risk_free = (1 + risk_free_rate) ** (1 / 12) - 1
+    downside = returns[returns < monthly_risk_free] - monthly_risk_free
+    if len(downside) < 2:
+        return None
+    return float(np.sqrt((downside.pow(2).sum() / (len(downside) - 1)) * 12))
+
+
+def _max_drawdown(returns: pd.Series) -> float:
+    wealth = (1 + pd.to_numeric(returns, errors="coerce").dropna()).cumprod()
+    return float((wealth / wealth.cummax() - 1).min())
+
+
+def _historical_var(returns: pd.Series, confidence: float) -> float | None:
+    returns = pd.to_numeric(returns, errors="coerce").dropna()
+    if returns.empty:
+        return None
+    return float(-returns.quantile(1 - confidence))
+
+
+def _historical_cvar(returns: pd.Series, confidence: float) -> float | None:
+    returns = pd.to_numeric(returns, errors="coerce").dropna()
+    if returns.empty:
+        return None
+    cutoff = returns.quantile(1 - confidence)
+    tail = returns[returns <= cutoff]
+    if tail.empty:
+        return None
+    return float(-tail.mean())
 
 
 def _latest_positive(series: pd.Series) -> float | None:

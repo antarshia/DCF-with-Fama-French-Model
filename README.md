@@ -34,9 +34,21 @@ streamlit run app.py
 - Current price comparison
 - Buy-below price after margin of safety
 - Projected revenue and free cash flow
+- Single-stock valuation and quality metrics, including FCF yield, P/E, P/S, EV/EBITDA, ROIC, EVA, DuPont ROE, Altman Z-score, DDM, and residual income value
 - WACC vs terminal growth sensitivity table
+- Portfolio performance and risk analytics, including CAGR, volatility, Sharpe, Sortino, max drawdown, beta, Jensen alpha, Treynor, information ratio, VaR, CVaR, correlation, risk contribution, and efficient frontier
 - Fama-French portfolio regression with factor exposures, alpha, and R-squared
 - CSV and Excel exports
+
+## Valuation Metrics
+
+Open the `Valuation Metrics` tab after loading a ticker to see extra stock-selection formulas:
+
+- Relative valuation: `P/E`, `Forward P/E`, `P/S`, `EV/EBITDA`, `P/FCF`
+- Cash flow and earnings yield: `FCF yield`, `Earnings yield`
+- Quality: `Revenue CAGR`, `FCF CAGR`, `FCF margin`, `ROIC`, `ROIC - WACC spread`, `EVA`, `ROE`, `DuPont ROE`
+- Balance sheet and risk: `Debt / market cap`, `Net cash / market cap`, `Altman Z-score`, reported beta
+- Extra valuation models: dividend discount model and residual income value when the needed inputs are available
 
 ## Portfolio Regression
 
@@ -47,6 +59,14 @@ Open the `Portfolio Regression` tab to run a monthly Fama-French regression for 
 - Choose the Fama-French 3-factor or 5-factor model.
 - Choose `Monthly rebalance` to keep weights fixed each month, or `Buy and hold` to use starting weights and let the portfolio drift.
 - Click `Run Regression` to see annualized alpha, R-squared, market beta, factor exposures, diagnostics, monthly regression data, and a CSV export.
+
+## Portfolio Analytics
+
+Open the `Portfolio Analytics` tab to evaluate a group of tickers against a benchmark such as `SPY`.
+
+- Enter tickers and optional weights the same way as the regression tab.
+- Choose the rebalancing method, benchmark ticker, risk-free rate, and date range.
+- Click `Run Portfolio Analytics` to see performance metrics, drawdowns, correlation, risk contribution, efficient frontier, monthly returns, and a CSV export.
 
 ## Data
 
